@@ -46,7 +46,6 @@ def query_data_with_gemini_as_agent(file_path: str, user_query: str, model_name:
         except UnicodeDecodeError:
             log_print(f"Failed to read with encoding '{encoding}'. Trying next...")
         except FileNotFoundError:
-            # Return empty strings for other outputs if file not found
             return f"Error: The file '{file_path}' was not found. Please ensure it's in the correct directory and spelled correctly.", "", "", ""
         except Exception as e:
             log_print(f"An unexpected error occurred while reading with encoding '{encoding}': {e}. Trying next...")

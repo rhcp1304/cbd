@@ -1,9 +1,15 @@
 import os
-import re
+import pandas as pd
+from django.core.management.base import BaseCommand, CommandError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
+CLIENT_SECRETS_FILE = 'credentials.json'
+TOKEN_FILE = 'token.json'
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 
 
 def get_google_sheets_service_oauth(client_secrets_file, token_file, scopes, logger=None):
@@ -21,8 +27,7 @@ def get_google_sheets_service_oauth(client_secrets_file, token_file, scopes, log
         if creds and creds.expired and creds.refresh_token:
             log_func("WARNING: Refreshing expired credentials...")
             try:
-                flow = InstalledAppFlow.from_client_secrets_file(client_secrets_file, scopes)
-                creds.refresh(flow.credentials)
+                creds.refresh(Request())
             except Exception as e:
                 log_func(f"ERROR: Error refreshing token: {e}. Re-authenticating...")
                 creds = None
@@ -40,9 +45,8 @@ def get_google_sheets_service_oauth(client_secrets_file, token_file, scopes, log
                 log_func(
                     "Please open the URL displayed in your console to authenticate, if a browser doesn't open automatically."
                 )
-                creds = flow.run_local_server(port=0)  # Opens browser for user authentication
+                creds = flow.run_local_server(port=0)
             except Exception as e:
-
                 raise ValueError(f"Authentication failed: {e}")
         log_func(f"Saving new credentials to {token_file}...")
         try:
@@ -74,83 +78,59 @@ def read_data_from_sheet_oauth(service, spreadsheet_id, range_name, logger=None)
             )
         elif err.resp.status == 404:
             log_func(f"ERROR: Spreadsheet ID '{spreadsheet_id}' or range '{range_name}' not found.")
-        raise  # Re-raise the HttpError to be caught by the calling management command
+        raise
     except Exception as e:
         log_func(f"ERROR: An unexpected error occurred while reading from Google Sheet: {e}")
         raise
 
 
-def sanitize_header_oauth(header_name):
-    s = re.sub(r'[^a-zA-Z0-9_]', '', header_name.replace(' ', '_'))
-    s = s.strip('_')
-    if not s:
-        return "column_unnamed"
-    if s and s[0].isdigit():
-        s = '_' + s
-    return s
+class Command(BaseCommand):
+    help = 'Reads data from a Google Sheet and prints its head and shape.'
 
+    def add_arguments(self, parser):
+        parser.add_argument('spreadsheet_id', type=str,
+                            help='The ID of the Google Spreadsheet.')
+        parser.add_argument('sheet_range', type=str,
+                            help='The range of the sheet to read (e.g., "Sheet1!A:Z").')
 
-def create_table_from_headers_oauth(cursor, table_name, headers, logger=None):
-    log_func = logger if logger else print
-    sanitized_headers = [sanitize_header_oauth(h) for h in headers]
-    if not sanitized_headers:
-        raise ValueError("No valid headers found to create table.")
-    seen = {}
-    unique_sanitized_headers = []
-    for h in sanitized_headers:
-        if h in seen:
-            seen[h] += 1
-            unique_sanitized_headers.append(f"{h}_{seen[h]}")
-        else:
-            seen[h] = 0
-            unique_sanitized_headers.append(h)
-    columns_sql_parts = ['"id" INTEGER PRIMARY KEY AUTOINCREMENT']
-    columns_sql_parts.extend([f'"{col_name}" TEXT' for col_name in unique_sanitized_headers])
-    columns_sql = ", ".join(columns_sql_parts)
-    create_table_sql = f'CREATE TABLE "{table_name}" ({columns_sql})'
-    log_func(f"Attempting to create table '{table_name}' with schema: {create_table_sql}")
+    def handle(self, *args, **options):
+        spreadsheet_id = options['spreadsheet_id']
+        sheet_range = options['sheet_range']
 
-    try:
-        cursor.execute(create_table_sql)
-        log_func(f"Table '{table_name}' created successfully.")
-    except Exception as e:
-        log_func(f"Error creating table '{table_name}': {e}")
-        raise ValueError(f"Error creating table '{table_name}': {e}. "
-                         f"Ensure the table doesn't already exist or use --drop-table.")
+        self.stdout.write(self.style.SUCCESS(
+            f"Attempting to read data from Google Sheet ID: {spreadsheet_id}, Range: {sheet_range}"
+        ))
 
+        try:
+            # 1. Get the Google Sheets service
+            sheets_service = get_google_sheets_service_oauth(
+                CLIENT_SECRETS_FILE, TOKEN_FILE, SCOPES, logger=self.stdout.write
+            )
 
-def insert_data_into_db_oauth(cursor, table_name, data, logger=None):
-    log_func = logger if logger else print
-    if not data or len(data) < 2:
-        log_func("WARNING: No data rows after header to insert.")
-        return
+            # 2. Read data from the sheet
+            data_values = read_data_from_sheet_oauth(
+                sheets_service, spreadsheet_id, sheet_range, logger=self.stdout.write
+            )
 
-    original_headers = data[0]
-    rows_to_insert = data[1:]
-    sanitized_headers = [sanitize_header_oauth(h) for h in original_headers]
-    seen = {}
-    unique_sanitized_headers = []
-    for h in sanitized_headers:
-        if h in seen:
-            seen[h] += 1
-            unique_sanitized_headers.append(f"{h}_{seen[h]}")
-        else:
-            seen[h] = 0
-            unique_sanitized_headers.append(h)
-    columns_for_insert = ', '.join([f'"{h}"' for h in unique_sanitized_headers])
-    placeholders = ', '.join(['%s' for _ in unique_sanitized_headers])
+            if data_values:
+                # The first row is typically the header
+                headers = data_values[0]
+                # The rest are the data rows
+                data_rows = data_values[1:]
 
-    insert_sql = f'INSERT INTO "{table_name}" ({columns_for_insert}) VALUES ({placeholders})'
-    log_func(f"Preparing to insert {len(rows_to_insert)} rows into '{table_name}'.")
-    num_expected_columns = len(unique_sanitized_headers)
-    padded_rows = []
-    for row in rows_to_insert:
-        padded_row = list(row) + [None] * (num_expected_columns - len(row))
-        padded_rows.append(padded_row[:num_expected_columns])
+                # Create a Pandas DataFrame
+                df = pd.DataFrame(data_rows, columns=headers)
 
-    try:
-        cursor.executemany(insert_sql, padded_rows)
-        log_func(f"Successfully inserted {len(padded_rows)} rows.")
-    except Exception as e:
-        log_func(f"Error inserting data into '{table_name}': {e}")
-        raise ValueError(f"Error inserting data into '{table_name}': {e}")
+                self.stdout.write(self.style.SUCCESS("\nSuccessfully read data into Pandas DataFrame:"))
+                self.stdout.write(df.head().to_markdown(index=False)) # Print the first 5 rows in markdown
+                self.stdout.write(f"\nDataFrame shape: {df.shape}")
+            else:
+                self.stdout.write(self.style.WARNING("No data was read from the Google Sheet."))
+
+        except ValueError as ve:
+            raise CommandError(f"Configuration Error: {ve}")
+        except HttpError as he:
+            raise CommandError(f"Google Sheets API Error: {he}")
+        except Exception as e:
+            raise CommandError(f"An unexpected error occurred: {e}")
+
